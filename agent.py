@@ -4,6 +4,14 @@ import datetime
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
+from google_services import (
+    list_unread_emails,
+    get_email_details,
+    mark_email_as_read,
+    send_reply,
+    check_calendar_availability,
+    create_calendar_event
+)
 
 # Load env variables from .env file
 load_dotenv()
@@ -16,60 +24,115 @@ if api_key and api_key != "your_gemini_api_key_here":
 else:
     print("Warning: GEMINI_API_KEY not found or is placeholder in environment variables. Please check your .env file.")
 
-def analyze_email(email_content, current_time_iso=None):
-    """Uses Gemini to determine if an email is a meeting request, extract details, and format them."""
-    if not current_time_iso:
-        current_time_iso = datetime.datetime.now().isoformat()
+def run_agent():
+    """Runs the autonomous scheduling agent using Gemini Function Calling (Skills)."""
+    if not client:
+        print("Error: Gemini Client is not initialized. Please set GEMINI_API_KEY in .env.")
+        return
         
-    prompt = f"""
-Analyze the following email content. Determine if it is a request/invitation to schedule a meeting or event.
+    current_time_iso = datetime.datetime.now().isoformat()
+    system_prompt = f"""
+You are an Autonomous Meeting Scheduler Agent.
 Reference Current Time (for resolving relative terms like 'tomorrow', 'next Monday', etc.): {current_time_iso}
 
-Return your answer strictly as a valid JSON object. Do not wrap the JSON in markdown code blocks. The JSON must have the following keys:
-1. "is_meeting_request": (boolean) True if this email is clearly requesting or inviting to a meeting, session, call, or event. False otherwise.
-2. "is_missing_info": (boolean) True if some critical scheduling info (like date or time) is missing or ambiguous.
-3. "missing_info_reason": (string) Explanation of what is missing if is_missing_info is True (e.g. "Missing start time").
-4. "subject": (string) A suggested subject/title for the calendar event (e.g., "Intro Call with Yuval").
-5. "start_iso": (string or null) The proposed start time in ISO 8601 format (e.g., 'YYYY-MM-DDTHH:MM:SS').
-6. "end_iso": (string or null) The proposed end time in ISO 8601 format (e.g., 'YYYY-MM-DDTHH:MM:SS'). If duration is not specified, assume 1 hour.
-7. "description": (string) A brief description or notes for the meeting.
-8. "attendees": (list of strings) List of attendee email addresses if found in the text.
-
-Email Subject: {email_content.get('subject', '')}
-Email From: {email_content.get('sender', '')}
-Email Content:
-{email_content.get('body', '')}
+Your goal is to process all unread emails in the user's mailbox.
+Follow this workflow:
+1. Retrieve the list of unread emails using list_unread_emails.
+2. For each unread email:
+   a. Retrieve its full details using get_email_details.
+   b. Analyze if the email content is a request/invitation to schedule a meeting or event.
+   c. If it is NOT a meeting request, mark it as read using mark_email_as_read and proceed to the next email.
+   d. If it IS a meeting request:
+      - Check if any critical scheduling information (e.g. date, start time, end time) is missing or ambiguous.
+      - If details are missing, send a reply to the sender (using send_reply) explaining what is missing (e.g. "missing start time"), mark the email as read using mark_email_as_read, and proceed to the next email.
+      - If details are complete, check calendar availability for the proposed start and end time (using check_calendar_availability).
+      - If the slot is available, create the calendar event (using create_calendar_event), send a confirmation reply containing the event link (using send_reply), and mark the email as read (using mark_email_as_read).
+      - If the slot is busy, send a polite reply declining the slot and asking for alternative times (using send_reply), and mark the email as read (using mark_email_as_read).
+3. Once all unread emails have been processed, provide a summary of the actions taken.
 """
-    try:
-        if not client:
-            raise ValueError("Gemini Client is not initialized. Please set GEMINI_API_KEY in .env.")
+
+    messages = [
+        types.Content(role="user", parts=[types.Part.from_text(text="Please start processing unread emails now.")])
+    ]
+    
+    tool_map = {
+        "list_unread_emails": list_unread_emails,
+        "get_email_details": get_email_details,
+        "mark_email_as_read": mark_email_as_read,
+        "send_reply": send_reply,
+        "check_calendar_availability": check_calendar_availability,
+        "create_calendar_event": create_calendar_event
+    }
+    
+    config = types.GenerateContentConfig(
+        system_instruction=system_prompt,
+        tools=[
+            list_unread_emails,
+            get_email_details,
+            mark_email_as_read,
+            send_reply,
+            check_calendar_availability,
+            create_calendar_event
+        ],
+        temperature=0.0
+    )
+    
+    print("Agent autonomous execution started...")
+    
+    while True:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json"
-            )
+            contents=messages,
+            config=config
         )
-        text = response.text.strip()
-        if text.startswith("```json"):
-            text = text[7:]
-        elif text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-        text = text.strip()
-        data = json.loads(text)
-        return data
-    except Exception as e:
-        print(f"Error parsing email with Gemini: {e}")
-        # Return fallback non-meeting response
-        return {
-            "is_meeting_request": False,
-            "is_missing_info": False,
-            "missing_info_reason": "",
-            "subject": "",
-            "start_iso": None,
-            "end_iso": None,
-            "description": "",
-            "attendees": []
-        }
+        
+        # Add assistant's response to history
+        if response.candidates and response.candidates[0].content:
+            messages.append(response.candidates[0].content)
+        
+        # Check if there are function calls requested
+        function_calls = response.function_calls
+        if not function_calls:
+            if response.text:
+                print(f"\n[Agent Final Response] {response.text}")
+            break
+            
+        tool_responses = []
+        for call in function_calls:
+            name = call.name
+            args = call.args
+            
+            # Print clean log of the tool execution
+            print(f"\n[Tool Call] {name} called with arguments: {json.dumps(args)}")
+            
+            if name in tool_map:
+                try:
+                    result = tool_map[name](**args)
+                    print(f"[Tool Response] {name} returned: {result}")
+                    tool_responses.append(
+                        types.Part.from_function_response(
+                            name=name,
+                            response={"result": result}
+                        )
+                    )
+                except Exception as e:
+                    print(f"[Tool Error] {name} failed: {e}")
+                    tool_responses.append(
+                        types.Part.from_function_response(
+                            name=name,
+                            response={"error": str(e)}
+                        )
+                    )
+            else:
+                print(f"[Tool Error] Unknown tool: {name}")
+                tool_responses.append(
+                    types.Part.from_function_response(
+                        name=name,
+                        response={"error": f"Unknown function: {name}"}
+                    )
+                )
+                
+        # Append the tool responses as a message from user role
+        messages.append(
+            types.Content(role="user", parts=tool_responses)
+        )
