@@ -1,0 +1,18 @@
+# Secrets & Credentials
+.env
+token.json
+credentials.json
+client_secret_*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+pip-log.txt
+pip-delete-this-directory.txt
+.venv/
+.env/
